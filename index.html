@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Lightweight Shaka Player</title>
+
+  <!-- Non-blocking load Shaka CSS -->
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+  <link rel="preload" href="https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.16.3/controls.min.css" as="style" onload="this.rel='stylesheet'">
+  <noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.16.3/controls.min.css"></noscript>
+
+  <!-- Shaka (defer) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.16.3/shaka-player.compiled.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.16.3/shaka-player.ui.min.js" defer></script>
+
+  <style>
+    :root{--bg:#000;--accent:#ff2b2b;--muted:#9aa0a6;--white:#fff;--font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--white);font-family:var(--font);-webkit-font-smoothing:antialiased}
+    .wrap{max-width:1200px;margin:0 auto;padding:clamp(8px,2vw,20px)}
+    .video-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:10px;overflow:hidden}
+    video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
+    .overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:40;pointer-events:auto}
+    .play{width:64px;height:64px;border-radius:999px;background:var(--accent);display:grid;place-items:center;cursor:pointer}
+    .spinner{width:36px;height:36px;border-radius:50%;border:3px solid rgba(255,255,255,.08);border-top-color:var(--accent);animation:spin 1s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+    @media (max-width:480px){.video-wrap{border-radius:8px}}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="video-wrap" id="player" role="application" aria-label="Live Stream Player" tabindex="0">
+      <div class="overlay" id="loading">
+        <div style="text-align:center">
+          <div class="spinner" aria-hidden="true"></div>
+          <div style="margin-top:8px;font-size:14px">Memuat player…</div>
+        </div>
+      </div>
+
+      <div class="overlay" id="play" style="display:none" tabindex="0" role="button" aria-label="Play">
+        <div class="play" id="playBtn" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="#fff"><path d="M8 5v14l11-7z"/></svg>
+        </div>
+      </div>
+
+      <div data-shaka-player-container style="position:absolute;inset:0;z-index:10">
+        <video id="video" playsinline preload="metadata"></video>
+      </div>
+    </div>
+  </main>
+
+  <div class="sr-only" aria-live="polite" id="status">Siap</div>
+
+<script>
+/*
+  Versi final: fetch absolute channels JSON dari pages.dev,
+  normalisasi k1 (KID) dan k2 (key), pasang clearKeys bila manifest .mpd.
+  NOTE: Pastikan CORS di https://2026elclasico.pages.dev mengizinkan fetch
+*/
+
+const CHANNELS_JSON_ABS = 'https://2026elclasico.pages.dev/channels-keys.json';
+const CHANNELS_JSON_REL = 'channels-keys.json'; // fallback lokal
+
+/* util */
+const $ = id => document.getElementById(id);
+function show(id, v = true){ $(id).style.display = v ? '' : 'none'; }
+function getParam(name){ return new URLSearchParams(location.search).get(name); }
+
+/* validation / normalization helpers */
+const reHex = /^[0-9a-fA-F]+$/;
+const reB64 = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function isHex(s){ return typeof s === 'string' && reHex.test(s); }
+function isBase64(s){ return typeof s === 'string' && reB64.test(s); }
+
+function b64ToHex(b64){
+  try{
+    const bin = atob(b64);
+    return Array.from(bin).map(c => ('0' + c.charCodeAt(0).toString(16)).slice(-2)).join('');
+  }catch(e){
+    return null;
+  }
+}
+
+// Normalize KID: remove dashes, lowercase. If base64 -> convert to hex.
+function normalizeKid(raw){
+  if(!raw) return null;
+  let s = raw.trim();
+  // if looks like base64 -> convert
+  if(isBase64(s)){
+    const h = b64ToHex(s);
+    if(h) return h.toLowerCase();
+  }
+  // remove uuid dashes
+  s = s.replace(/-/g,'').toLowerCase();
+  return s;
+}
+
+// Normalize key: prefer hex (lowercase). If base64 -> convert to hex.
+function normalizeKey(raw){
+  if(!raw) return null;
+  const s = raw.trim();
+  if(isHex(s)) return s.toLowerCase();
+  if(isBase64(s)){
+    const h = b64ToHex(s);
+    if(h) return h.toLowerCase();
+  }
+  // fallback: lowercase (may be invalid)
+  return s.toLowerCase();
+}
+
+/* fetch with absolute -> fallback relative */
+async function fetchChannels(){
+  async function tryFetch(url){
+    const res = await fetch(url, { cache: 'reload' });
+    if(!res.ok) throw new Error('Fetch gagal: ' + res.status + ' ' + url);
+    return res.json();
+  }
+  try{
+    return await tryFetch(CHANNELS_JSON_ABS);
+  }catch(err){
+    console.warn('Fetch absolute gagal, coba relatif:', err);
+    return await tryFetch(CHANNELS_JSON_REL);
+  }
+}
+
+/* load + normalize channels */
+async function loadChannels(){
+  const raw = await fetchChannels();
+  // normalize each entry
+  for(const name of Object.keys(raw || {})){
+    const c = raw[name];
+    if(!c) continue;
+    if(c.k1) c.k1 = normalizeKid(c.k1);
+    if(c.k2) c.k2 = normalizeKey(c.k2);
+    // quick validations
+    if(c.k1 && (!isHex(c.k1) || c.k1.length !== 32)) console.warn(`KID tidak valid untuk ${name}:`, c.k1);
+    if(c.k2 && (!isHex(c.k2) || c.k2.length !== 32)) console.warn(`Key tidak valid untuk ${name}:`, c.k2);
+  }
+  return raw;
+}
+
+/* wait for shaka to be loaded (defer scripts might still be parsing) */
+function waitForShaka(){
+  return new Promise((res) => {
+    if(window.shaka) return res();
+    const t = setInterval(()=>{ if(window.shaka){ clearInterval(t); res(); } }, 50);
+    setTimeout(()=>{ clearInterval(t); res(); }, 5000);
+  });
+}
+
+async function init(){
+  const id = getParam('id');
+  if(!id){ $('status').textContent = 'Parameter id tidak ditemukan (gunakan ?id=BEINS3)'; show('loading',false); return; }
+
+  show('loading', true);
+  show('play', false);
+
+  let channels;
+  try{
+    channels = await loadChannels();
+  }catch(e){
+    console.error('Gagal memuat channels JSON', e);
+    $('status').textContent = 'Gagal memuat konfigurasi';
+    show('loading',false);
+    return;
+  }
+
+  const conf = channels[id];
+  if(!conf){ $('status').textContent = 'ID tidak valid'; show('loading',false); return; }
+
+  const url = conf.url;
+  // preconnect to origin for slight perf gain
+  try{
+    const u = new URL(url);
+    const link = document.createElement('link');
+    link.rel = 'preconnect'; link.href = u.origin; link.crossOrigin = '';
+    document.head.appendChild(link);
+  }catch(e){}
+
+  await waitForShaka();
+
+  setupShaka(url, conf);
+}
+
+function setupShaka(url, conf){
+  const video = $('video');
+  const container = document.querySelector('[data-shaka-player-container]');
+
+  if(!window.shaka || !shaka.Player.isBrowserSupported()){
+    $('status').textContent = 'Browser tidak mendukung Shaka Player';
+    show('loading',false);
+    return;
+  }
+
+  // destroy previous instances (if any)
+  if(window._player){ try{ window._player.destroy(); }catch(e){} window._player = null; }
+  if(window._ui){ try{ window._ui.destroy(); }catch(e){} window._ui = null; }
+
+  const player = new shaka.Player(video);
+  window._player = player;
+  const ui = new shaka.ui.Overlay(player, container, video);
+  window._ui = ui;
+
+  // build config, include clearKeys when mpd + keys available
+  const cfg = { streaming:{bufferingGoal:8,rebufferingGoal:3}, abr:{enabled:true} };
+  if(url.toLowerCase().includes('.mpd') && conf && conf.k1 && conf.k2){
+    // conf.k1 = normalized KID hex, conf.k2 = normalized key hex
+    const ck = {}; ck[conf.k1] = conf.k2;
+    cfg.drm = { clearKeys: ck };
+    console.log('Applying clearKeys:', ck);
+  } else {
+    console.log('No clearKeys applied (not MPD or keys missing).');
+  }
+
+  player.configure(cfg);
+
+  // basic event handlers
+  video.muted = false;
+  video.volume = 1;
+
+  video.addEventListener('waiting', ()=>{ /* could show buffering indicator */ });
+  video.addEventListener('playing', ()=>{ /* hide buffering */ });
+
+  player.addEventListener('error', e => {
+    console.error('Shaka error', e);
+    $('status').textContent = 'Error streaming: ' + (e?.detail?.message || e.message || e);
+  });
+
+  // load manifest (no autoplay)
+  player.load(url).then(()=>{
+    show('loading', false);
+    show('play', true);
+    $('status').textContent = 'Siap, tekan play';
+  }).catch(err=>{
+    console.warn('Load failed', err);
+    $('status').textContent = 'Gagal memuat manifest';
+    show('loading', false);
+  });
+
+  // play overlay
+  function startPlayback(){
+    video.play().then(()=>{ show('play', false); }).catch(()=>{ show('play', false); });
+  }
+  $('playBtn').onclick = startPlayback;
+  $('play').onclick = startPlayback;
+  $('play').onkeydown = (e)=>{ if(e.key === 'Enter' || e.key === ' ') startPlayback(); };
+}
+
+/* init on DOM ready */
+if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+else init();
+</script>
+</body>
+</html>
